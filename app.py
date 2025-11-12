@@ -144,136 +144,271 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# =============================================================
-#  DATA REFRESH TIMER & CACHE INFO
-# =============================================================
+# ===========================
+# DATA SOURCES (BallDontLie)
+# ===========================
+import datetime as _dt
+from functools import lru_cache
 
-def refresh_notice():
-    st.sidebar.info(
-        "🔄 Data refreshes automatically every 24 hours.\n"
-        "Bootstrap window = 15 games per player.\n"
-        "Simulations = 1 000 per run."
-    )
+_BDL_BASE = "https://api.balldontlie.io/v1"   # v1 is the stable free API (v2 docs rolling in)
+_BDL_TIMEOUT = 20
+_LAST_N = 15  # rolling window for your model
+_SIM_RUNS_DEFAULT = 1000
 
-refresh_notice()
+HEADSHOT_FALLBACK = "https://static.thenounproject.com/png/363640-200.png"
 
-# ---- End of Part 1A ----
-# =============================================================
-#  NBA API + SportsMetrics Dual-Source Data Fetcher
-# =============================================================
-
-from nba_api.stats.endpoints import leaguedashteamstats, playergamelog, commonplayerinfo
-from nba_api.stats.static import players
-
-@st.cache_data(ttl=86400)
-def fetch_team_metrics():
-    """
-    Pull team pace and defense metrics.
-    Tries nba_api first; falls back to SportsMetrics API if unavailable.
-    """
+def _rget(url, params=None, timeout=_BDL_TIMEOUT):
     try:
-        team_stats = leaguedashteamstats.LeagueDashTeamStats(
-            measure_type_detailed_defense='Base',
-            per_mode_detailed='PerGame',
-            season=NBA_SEASON
-        ).get_data_frames()[0]
-        df = team_stats[['TEAM_ID','TEAM_NAME','PACE','DEF_RATING']]
-        df.columns = ['team_id','team_name','pace','def_rating']
-        return df
+        r = requests.get(url, params=params or {}, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
     except Exception as e:
-        st.warning(f"NBA API failed: {e}. Switching to SportsMetrics backup ...")
+        st.warning(f"Data call failed: {url} — {e}")
+        return None
+
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def bdl_players_search(query: str):
+    """Search players by name once/day; UI text_inputs will use this."""
+    out = _rget(f"{_BDL_BASE}/players", params={"search": query, "per_page": 50})
+    return out["data"] if out and "data" in out else []
+
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def bdl_player_by_id(pid: int):
+    out = _rget(f"{_BDL_BASE}/players/{pid}")
+    return out or {}
+
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def bdl_games_for_dates(dates_iso):
+    """Fetch games for a list of ISO dates (YYYY-MM-DD)."""
+    data = []
+    for d in dates_iso:
+        page = 1
+        while True:
+            js = _rget(f"{_BDL_BASE}/games", params={"dates[]": d, "per_page": 100, "page": page})
+            if not js: break
+            data.extend(js.get("data", []))
+            if page >= js.get("meta", {}).get("total_pages", 1): break
+            page += 1
+    return data
+
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def bdl_stats_last_n_games(player_id: int, last_n: int = _LAST_N):
+    """Pull last-N box scores for a player (points/reb/ast/fga/fta/tov/min etc.)."""
+    # BallDontLie returns recent-first when you filter by seasons+dates; simplest is to page back by "per_page"
+    stats = []
+    page = 1
+    per_page = 100
+    while len(stats) < last_n:
+        js = _rget(f"{_BDL_BASE}/stats", params={
+            "player_ids[]": player_id,
+            "per_page": per_page,
+            "page": page,
+            "postseason": "false",
+        })
+        if not js: break
+        stats.extend(js.get("data", []))
+        if page >= js.get("meta", {}).get("total_pages", 1): break
+        page += 1
+    return stats[:last_n]
+
+# ---------- Derived Team Totals & Opponent Context ----------
+
+def _possessions(row):
+    """
+    Standard possessions estimate:
+    Poss ≈ FGA + 0.44*FTA - ORB + TOV
+    We'll compute team and opponent, then pace per 48 later.
+    """
+    return (row["fga"] + 0.44*row["fta"] - row["orb"] + row["tov"])
+
+def _safe_div(a, b):
+    return float(a) / float(b) if b else 0.0
+
+def _to_minutes(min_str):
+    # BallDontLie minutes can be "MM:SS". Convert to float minutes.
+    if not min_str: return 0.0
+    try:
+        mm, ss = str(min_str).split(":")
+        return float(mm) + float(ss)/60.0
+    except:
         try:
-            res = cached_request("https://api.sportsmetrics.io/nba/team_metrics")
-            if res:
-                df = pd.DataFrame(res)
-                if not {'team_name','pace','def_rating'}.issubset(df.columns):
-                    st.error("SportsMetrics data missing expected columns.")
-                    return pd.DataFrame(columns=['team_id','team_name','pace','def_rating'])
-                return df
-        except Exception as ex:
-            st.error(f"SportsMetrics fallback also failed: {ex}")
-    return pd.DataFrame(columns=['team_id','team_name','pace','def_rating'])
+            return float(min_str)
+        except:
+            return 0.0
 
-team_metrics = fetch_team_metrics()
+def _frame_from_stats(stats):
+    if not stats:
+        return pd.DataFrame()
+    rows = []
+    for s in stats:
+        ply = s.get("player", {}) or {}
+        tm = s.get("team", {}) or {}
+        g = s.get("game", {}) or {}
+        st = s.get("stats", {}) or s  # some libraries nest under "stats"
+        rows.append({
+            "game_id": g.get("id"),
+            "date": g.get("date", "")[:10],
+            "home_team_id": g.get("home_team_id"),
+            "visitor_team_id": g.get("visitor_team_id"),
+            "team_id": tm.get("id"),
+            "player_id": ply.get("id"),
+            "min": _to_minutes(st.get("min")),
+            "pts": st.get("pts", 0) or 0,
+            "reb": st.get("reb", 0) or 0,
+            "ast": st.get("ast", 0) or 0,
+            "stl": st.get("stl", 0) or 0,
+            "blk": st.get("blk", 0) or 0,
+            "tov": st.get("turnover", 0) or st.get("tov", 0) or 0,
+            "fga": st.get("fga", 0) or 0,
+            "fgm": st.get("fgm", 0) or 0,
+            "fta": st.get("fta", 0) or 0,
+            "ftm": st.get("ftm", 0) or 0,
+            "oreb": st.get("oreb", 0) or 0,
+            "dreb": st.get("dreb", 0) or 0,
+        })
+    return pd.DataFrame(rows)
 
-# =============================================================
-#  PLAYER LOOKUP & INFO UTILITIES
-# =============================================================
+def _team_game_totals(df_all_players):
+    # Sum across players within each (game_id, team_id)
+    if df_all_players.empty:
+        return pd.DataFrame()
+    grp = df_all_players.groupby(["game_id","team_id"], as_index=False).agg({
+        "pts":"sum","reb":"sum","ast":"sum","tov":"sum",
+        "fga":"sum","fta":"sum","oreb":"sum","dreb":"sum","min":"sum"
+    })
+    grp["orb"] = grp["oreb"]
+    grp["poss"] = grp.apply(_possessions, axis=1)
+    return grp
 
-@lru_cache(maxsize=512)
-def find_player_id(name):
-    """
-    Resolve player name → ID mapping (case-insensitive).
-    Returns None if no match found.
-    """
-    plist = players.get_players()
-    for p in plist:
-        if name.lower() in p['full_name'].lower():
-            return p['id']
-    return None
+def _opponent_id(row):
+    # Identify opponent team in the same game
+    if row["team_id"] == row["home_team_id"]:
+        return row["visitor_team_id"]
+    else:
+        return row["home_team_id"]
 
-def get_player_team_pos(pid):
-    """
-    Get player's team and position info.
-    """
-    try:
-        data = commonplayerinfo.CommonPlayerInfo(player_id=pid).get_data_frames()[0]
-        return data.loc[0,'TEAM_NAME'], data.loc[0,'POSITION']
-    except Exception:
-        return "Unknown","N/A"
+def _merge_team_context(df_p, df_totals, df_games_meta):
+    if df_p.empty: return df_p
+    # add opponent team id from game meta
+    meta = df_games_meta[["id","home_team_id","visitor_team_id"]].rename(columns={"id":"game_id"})
+    out = df_p.merge(meta, on="game_id", how="left")
+    out["opp_team_id"] = out.apply(_opponent_id, axis=1)
+    # team totals and opponent totals same game
+    out = out.merge(df_totals.rename(columns={
+        "pts":"team_pts","reb":"team_reb","ast":"team_ast","tov":"team_tov",
+        "fga":"team_fga","fta":"team_fta","oreb":"team_orb","dreb":"team_drb",
+        "min":"team_min","poss":"team_poss"
+    }), on=["game_id","team_id"], how="left")
+    opp = df_totals.rename(columns={
+        "team_id":"opp_team_id",
+        "pts":"opp_pts","reb":"opp_reb","ast":"opp_ast","tov":"opp_tov",
+        "fga":"opp_fga","fta":"opp_fta","oreb":"opp_orb","dreb":"opp_drb",
+        "poss":"opp_poss"
+    })
+    out = out.merge(opp[["game_id","opp_team_id","opp_pts","opp_reb","opp_tov","opp_fga","opp_fta","opp_orb","opp_drb","opp_poss"]],
+                    on=["game_id","opp_team_id"], how="left")
+    return out
 
-# =============================================================
-#  PLAYER GAME LOG FETCHER (15-Game Window)
-# =============================================================
+def _estimate_usg(row):
+    # USG% ≈ 100 * ((FGA + 0.44*FTA + TOV) * (TeamMin/5)) / (MP * (TeamFGA + 0.44*TeamFTA + TeamTOV))
+    mp = row.get("min", 0.0) or 0.0
+    if mp <= 0 or not row.get("team_fga"): return 0.0
+    num = (row.get("fga",0)+0.44*row.get("fta",0)+row.get("tov",0)) * (row.get("team_min",0)/5.0)
+    den = mp * (row.get("team_fga",0)+0.44*row.get("team_fta",0)+row.get("team_tov",0))
+    return 100.0 * _safe_div(num, den)
 
-@st.cache_data(ttl=3600)
-def get_last_games(pid, n=BOOTSTRAP_WINDOW):
-    """
-    Retrieve a player's last N games from nba_api.
-    Adds PRA (PTS + REB + AST) column.
-    """
-    try:
-        df = playergamelog.PlayerGameLog(
-            player_id=pid,
-            season=NBA_SEASON
-        ).get_data_frames()[0]
-        df = df.head(n)
-        df['PRA'] = df['PTS'] + df['REB'] + df['AST']
-        return df[['GAME_DATE','PTS','REB','AST','PRA']]
-    except Exception as e:
-        st.warning(f"Game log fetch failed for {pid}: {e}")
-        return pd.DataFrame(columns=['GAME_DATE','PTS','REB','AST','PRA'])
+def _team_def_rating(row):
+    # Opponent points per 100 possessions allowed by player's team (game-level)
+    return 100.0 * _safe_div(row.get("opp_pts",0), row.get("team_poss",0))
 
-# =============================================================
-#  DATA PREPROCESSING HELPERS
-# =============================================================
+def _team_pace(row):
+    # Possessions per 48 minutes (use both teams' poss estimate)
+    poss = 0.5 * ((row.get("team_poss",0)) + (row.get("opp_poss",0)))
+    # minutes per team per game ~ 240 (48*5), but if bdl mins sum isn't 240, scale by actual
+    tm_min = max(row.get("team_min",240.0), 1.0)
+    return 48.0 * _safe_div(poss, (tm_min/5.0))
 
-def clean_gamelog(gamelog: pd.DataFrame) -> pd.DataFrame:
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def load_player_context(player_id: int, last_n: int = _LAST_N):
     """
-    Ensure numeric columns are floats and drop NaNs.
+    Returns:
+      logs_df: per-game row with pts/reb/ast/min/usg, team pace, team_def_rating, etc.
+      agg: aggregated rolling means/stdevs for modeling
+      headshot_url: best-effort headshot
     """
-    for c in ['PTS','REB','AST','PRA']:
-        if c in gamelog.columns:
-            gamelog[c] = pd.to_numeric(gamelog[c], errors='coerce')
-    return gamelog.dropna(subset=['PTS','REB','AST','PRA'])
+    # 1) player last-N stats
+    raw = bdl_stats_last_n_games(player_id, last_n=last_n)
+    if not raw:
+        return pd.DataFrame(), {}, HEADSHOT_FALLBACK
 
-def compute_player_trends(gamelog: pd.DataFrame) -> dict:
-    """
-    Compute rolling averages and volatility metrics for the last 15 games.
-    """
-    if gamelog.empty:
-        return {}
-    trends = {
-        "avg_pts": gamelog['PTS'].mean(),
-        "avg_reb": gamelog['REB'].mean(),
-        "avg_ast": gamelog['AST'].mean(),
-        "avg_pra": gamelog['PRA'].mean(),
-        "var_pra": np.var(gamelog['PRA']),
-        "skew_pra": skew(gamelog['PRA']),
-        "p25": np.percentile(gamelog['PRA'], 25),
-        "p75": np.percentile(gamelog['PRA'], 75)
+    logs = _frame_from_stats(raw)
+
+    # 2) fetch game metadata for those game_ids (to know home/visitor ids)
+    game_ids = logs["game_id"].dropna().unique().tolist()
+    games_meta = []
+    for gid in game_ids:
+        js = _rget(f"{_BDL_BASE}/games/{gid}")
+        if js: games_meta.append(js)
+    games_meta = pd.DataFrame(games_meta) if games_meta else pd.DataFrame(columns=["id","home_team_id","visitor_team_id"])
+
+    # 3) build team totals across ALL players who appeared in those games (for team FGA/FTA/TOV…)
+    #    We query per game both teams' player stats and aggregate.
+    totals_rows = []
+    for gid in game_ids:
+        page = 1
+        while True:
+            js = _rget(f"{_BDL_BASE}/stats", params={"game_ids[]": gid, "per_page": 100, "page": page})
+            if not js: break
+            sub = _frame_from_stats(js.get("data", []))
+            totals_rows.append(sub)
+            if page >= js.get("meta", {}).get("total_pages", 1): break
+            page += 1
+    all_players_this_set = pd.concat(totals_rows, ignore_index=True) if totals_rows else pd.DataFrame()
+    team_totals = _team_game_totals(all_players_this_set)
+
+    # 4) merge team/opponent context & compute derived metrics
+    ctx = _merge_team_context(logs, team_totals, games_meta)
+    if ctx.empty:
+        return logs, {}, HEADSHOT_FALLBACK
+    ctx["usg"] = ctx.apply(_estimate_usg, axis=1)
+    ctx["team_def_rating"] = ctx.apply(_team_def_rating, axis=1)
+    ctx["pace"] = ctx.apply(_team_pace, axis=1)
+
+    # 5) aggregate (rolling window) for model priors
+    def _agg(series):
+        return pd.Series({
+            "mean": float(np.nanmean(series)) if len(series) else 0.0,
+            "std":  float(np.nanstd(series, ddof=1)) if len(series) > 1 else 0.0,
+            "skew": float(skew(series, bias=False)) if len(series) > 2 else 0.0,
+            "kurt": float(kurtosis(series, bias=False)) if len(series) > 3 else 0.0
+        })
+
+    agg = {
+        "PTS": _agg(ctx["pts"]),
+        "REB": _agg(ctx["reb"]),
+        "AST": _agg(ctx["ast"]),
+        "MIN": _agg(ctx["min"]),
+        "USG": _agg(ctx["usg"]),
+        "PACE": _agg(ctx["pace"]),
+        "DEFRTG": _agg(ctx["team_def_rating"])
     }
-    return trends
+
+    # 6) headshot best-effort
+    # BallDontLie player object sometimes carries an "nba_id"; try to fetch once:
+    pmeta = bdl_player_by_id(player_id)
+    nba_id = None
+    # different mirrors label this differently; try common keys
+    for k in ("nba_id", "nba dot com player id", "person_id"):
+        if isinstance(pmeta.get(k), (int, str)) and str(pmeta.get(k)).strip():
+            nba_id = str(pmeta[k]).strip()
+            break
+    if nba_id and str(nba_id).isdigit():
+        headshot = f"https://cdn.nba.com/headshots/nba/latest/1040x760/{nba_id}.png"
+    else:
+        headshot = HEADSHOT_FALLBACK
+
+    return ctx.sort_values("date"), agg, headshot
+
 
 # ---- End of Part 1B ----
 # =============================================================
