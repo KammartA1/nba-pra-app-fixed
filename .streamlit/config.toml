@@ -11,3 +11,6 @@ headless = true
 maxUploadSize = 200
 enableCORS = false
 enableXsrfProtection = false
+
+[global]
+pythonVersion = "3.12"
